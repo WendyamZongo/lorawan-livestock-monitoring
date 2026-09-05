@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
+
+# Data files
+data.csv
+*.log
+
+# Arduino build files
+build/
+*.hex
+
+# KiCad
+*-backups/
+*.kicad_prl
+fp-info-cache
+*.bak
+
+# Keys — never commit real keys !
+keys.txt
+secrets.h
