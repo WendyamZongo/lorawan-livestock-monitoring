@@ -7,6 +7,17 @@ The system is designed for extensive grazing conditions, where animals are dispe
 **Status:** functional prototype. All four subsystems are implemented and working end to end. See Limitations for what is not yet in place.
 
 ---
+![Dashboard](web_dashboard.png)
+
+*Real-time herd monitoring dashboard*
+
+![Schematic](livestok_schematic.png)
+
+*Ear tag node schematic*
+
+![PCB](livestok_PCB.png)
+
+*Ear tag node PCB layout*
 
 ## System architecture
 
