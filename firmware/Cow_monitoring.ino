@@ -22,7 +22,7 @@
  * GPS TX     -> GP4
  * GPS RX     -> GP5
  *
- * Author: Yam Project
+ * Author: Wendyam Clovis Dubois Zongo
  * License: MIT
  */
 
@@ -45,13 +45,24 @@
 #define GPS_TX_PIN   5   // GPS RX connects here
 
 // --- POWER / TIMING CONFIGURATION ----------------------------
-// 4 uplinks per day -> one cycle every 6 hours
-#define SLEEP_SECONDS       (6UL * 60UL * 60UL)
+// Set TEST_MODE to 1 for bench testing: one cycle per minute instead
+// of one every six hours, so the sleep and wake path can be observed.
+// Set back to 0 before deploying.
+#define TEST_MODE 0
+
+#if TEST_MODE
+  #define SLEEP_SECONDS     60UL
+#else
+  // 4 uplinks per day -> one cycle every 6 hours
+  #define SLEEP_SECONDS     (6UL * 60UL * 60UL)
+ 
+#endif
+
 #define uS_PER_S            1000000ULL
 
 // How long we are willing to wait for a GPS fix before giving up.
 // Longer means better fix rate, shorter means less energy per cycle.
-#define GPS_FIX_TIMEOUT_MS  90000UL
+#define GPS_FIX_TIMEOUT_MS  180000UL
 
 // Set to 1 if a MOSFET cuts the GPS supply from a GPIO.
 // Set to 0 to rely on UBX backup mode only (no hardware change needed).
@@ -60,8 +71,26 @@
   #define GPS_EN_PIN 2
 #endif
 
+// UBX backup mode cuts GPS current to ~11 uA during sleep, but some
+// NEO-6M modules do not resume from it reliably. Set to 0 to leave the
+// receiver running: this costs battery life but rules the backup path
+// out as a cause when the module stops producing NMEA.
+#define GPS_BACKUP_MODE 1
+
+// Set to 1 to echo raw NMEA sentences to the serial monitor while
+// waiting for a fix. Use it to confirm the module is talking at all.
+#define GPS_DEBUG_NMEA 0
+
 // --- DS18B20 -------------------------------------------------
 DS18B20 sensor(DS18B20_PIN);
+
+// A 12-bit conversion takes 750 ms. Reading before it completes returns
+// the sensor's power-on scratchpad value of exactly 85.00 C, which is
+// not a measurement. Any reading at or above this bound is rejected.
+#define DS18B20_INVALID_HIGH   84.0
+#define DS18B20_INVALID_LOW   -50.0
+#define DS18B20_CONV_MS        800UL
+#define DS18B20_ATTEMPTS       3
 
 // --- GPS -----------------------------------------------------
 HardwareSerial gpsSerial(1);
@@ -82,6 +111,7 @@ uint8_t AppSKey[16] = {
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 uint32_t DevAddr = 0x00000000;
+
 
 // Frame counter must persist across deep sleep, otherwise the network
 // server rejects uplinks as replays. RTC_DATA_ATTR keeps it in RTC RAM,
@@ -246,24 +276,46 @@ void sendLoRa(float tempC, int32_t lat, int32_t lon, bool gpsValid) {
   msg[6] = frameCounter & 0xFF;
   msg[7] = (frameCounter >> 8) & 0xFF;
   msg[8] = 0x01;
-  memcpy(msg+9, encPayload, 11);
+  memcpy(msg + 9, encPayload, 11);
 
   uint8_t mic[4];
   computeMIC(msg, 20, mic);
 
   uint8_t packet[24];
   memcpy(packet, msg, 20);
-  memcpy(packet+19+1, mic, 4);
+  memcpy(packet + 20, mic, 4);
 
   radio.transmit(packet, 24);
   frameCounter++;
 }
 
+// --- TEMPERATURE ---------------------------------------------
+// Reads the DS18B20, rejecting the 85.00 C power-on default that comes
+// back when the conversion has not completed. Returns -99.0 on failure,
+// which the payload decoder treats as a sensor fault.
+float readTemperature() {
+  for (int attempt = 0; attempt < DS18B20_ATTEMPTS; attempt++) {
+    float t = sensor.getTempC();
+
+    if (!isnan(t) && t < DS18B20_INVALID_HIGH && t > DS18B20_INVALID_LOW) {
+      return t;
+    }
+
+    Serial.print("DS18B20: invalid reading (");
+    Serial.print(t);
+    Serial.println("), retrying");
+    delay(DS18B20_CONV_MS);
+  }
+  return -99.0;
+}
+
 // --- GPS POWER MANAGEMENT ------------------------------------
 
 // UBX-RXM-PMREQ: put the NEO-6M into backup mode indefinitely.
-// Draws roughly 11 uA instead of tens of mA.
+// Draws roughly 11 uA instead of tens of mA, and retains almanac and
+// ephemeris on boards with a V_BCKP supply, giving hot starts on wake.
 void gpsEnterBackup() {
+#if GPS_BACKUP_MODE
   const uint8_t pmreq[] = {
     0xB5, 0x62, 0x02, 0x41, 0x08, 0x00,
     0x00, 0x00, 0x00, 0x00,   // duration 0 = infinite
@@ -273,6 +325,7 @@ void gpsEnterBackup() {
   gpsSerial.write(pmreq, sizeof(pmreq));
   gpsSerial.flush();
   delay(50);
+#endif
 
 #if GPS_HARD_POWER_GATE
   digitalWrite(GPS_EN_PIN, LOW);
@@ -285,9 +338,17 @@ void gpsWake() {
   digitalWrite(GPS_EN_PIN, HIGH);
   delay(200);
 #endif
-  // Any traffic on the UART pulls the receiver out of backup mode.
-  gpsSerial.write(0xFF);
-  delay(100);
+
+#if GPS_BACKUP_MODE
+  // A single byte is not always enough. Some NEO-6M modules need
+  // sustained UART traffic and a longer settling delay before they
+  // leave backup mode and resume producing NMEA output.
+  for (int i = 0; i < 20; i++) {
+    gpsSerial.write(0xFF);
+  }
+  gpsSerial.flush();
+  delay(500);
+#endif
 }
 
 // Wait for a valid fix, or give up after GPS_FIX_TIMEOUT_MS.
@@ -296,7 +357,11 @@ bool acquireGpsFix(int32_t &lat, int32_t &lon) {
   uint32_t start = millis();
   while (millis() - start < GPS_FIX_TIMEOUT_MS) {
     while (gpsSerial.available() > 0) {
-      gps.encode(gpsSerial.read());
+      char c = gpsSerial.read();
+      gps.encode(c);
+#if GPS_DEBUG_NMEA
+      Serial.write(c);
+#endif
     }
     if (gps.location.isValid() && gps.location.age() < 2000) {
       lat = (int32_t)(gps.location.lat() * 10000);
@@ -344,6 +409,8 @@ void setup() {
   Serial.println(frameCounter);
 
   // --- GPS ---
+  // Started first so the receiver begins acquiring while the radio and
+  // the temperature sensor are being brought up.
   gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   gpsWake();
 
@@ -371,10 +438,9 @@ void setup() {
   radio.setCodingRate(5);
 
   // --- Temperature ---
-  float tempC = sensor.getTempC();
-  if (isnan(tempC)) {
-    Serial.println("DS18B20 not detected");
-    tempC = -99.0;   // sentinel value, flagged by the decoder
+  float tempC = readTemperature();
+  if (tempC < -90.0) {
+    Serial.println("DS18B20 fault, sending sentinel value");
   } else {
     Serial.print("Temperature: ");
     Serial.print(tempC);
